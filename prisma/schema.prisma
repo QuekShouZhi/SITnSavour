@@ -1,0 +1,179 @@
+// SITnSavour – Prisma schema (DRAFT v1, awaiting approval)
+// Money is stored as integer minor units (cents) to avoid floating-point errors
+// and to match Stripe's API, which also uses minor units.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // Neon pooled connection (serverless runtime)
+  directUrl = env("DIRECT_URL") // Neon direct connection (migrations)
+}
+
+// ───────────── Enums ─────────────
+
+enum Role {
+  CUSTOMER
+  MERCHANT_OWNER
+  ADMIN
+}
+
+enum OutletType {
+  FOOD_COURT // multiple stalls (e.g. Koufu)
+  STANDALONE // single-brand outlet (e.g. McDonald's)
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEAWAY
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT // Stripe Checkout session created, not yet paid
+  PAID // set ONLY by the Stripe webhook
+  PREPARING
+  READY
+  COMPLETED
+  CANCELLED
+  PAYMENT_FAILED
+}
+
+// ───────────── Models ─────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  phone     String?
+  role      Role     @default(CUSTOMER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders         Order[]
+  ownedMerchants Merchant[] @relation("MerchantOwner")
+}
+
+/// A physical location. A food court holds many merchants (stalls);
+/// a standalone outlet holds exactly one.
+model Outlet {
+  id        String     @id @default(cuid())
+  slug      String     @unique
+  name      String
+  type      OutletType
+  address   String?
+  city      String
+  country   String // ISO 3166-1 alpha-2, e.g. "SG"
+  timezone  String // IANA, e.g. "Asia/Singapore" – used for opening hours & pickup times
+  latitude  Float?
+  longitude Float?
+  imageUrl  String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  merchants Merchant[]
+
+  @@index([country, city])
+}
+
+model Merchant {
+  id               String   @id @default(cuid())
+  slug             String   @unique
+  name             String
+  description      String?
+  cuisine          String?
+  imageUrl         String?
+  currency         String   @default("SGD") // ISO 4217, passed to Stripe
+  opensAt          String // "HH:mm" in the outlet's timezone
+  closesAt         String // "HH:mm" in the outlet's timezone
+  takeawayFeeCents Int      @default(0)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  outletId String
+  outlet   Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  ownerId  String?
+  owner    User?   @relation("MerchantOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  menuItems MenuItem[]
+  orders    Order[]
+
+  @@index([outletId])
+}
+
+model MenuItem {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  priceCents  Int
+  imageUrl    String?
+  category    String // e.g. "Popular", "Hot Beverage", "Mains"
+  isAvailable Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  orderItems OrderItem[]
+
+  @@index([merchantId, category])
+}
+
+/// One order = one merchant (keeps checkout, payment and reporting simple).
+model Order {
+  id          String      @id @default(cuid())
+  orderNumber String      @unique // short human-friendly code shown to the customer
+  type        OrderType
+  status      OrderStatus @default(PENDING_PAYMENT)
+  pickupTime  DateTime? // required when type = TAKEAWAY (enforced in app logic)
+
+  // Contact details – allows guest checkout without an account
+  contactEmail String?
+  contactPhone String?
+
+  // Totals are recomputed on the server from DB prices, never trusted from the client
+  currency         String
+  subtotalCents    Int
+  takeawayFeeCents Int    @default(0)
+  totalCents       Int
+
+  // Stripe
+  stripeCheckoutSessionId String?   @unique
+  stripePaymentIntentId   String?   @unique
+  paidAt                  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
+
+  items OrderItem[]
+
+  @@index([merchantId, createdAt]) // analytics (Trends) queries
+  @@index([userId, createdAt]) // past orders
+  @@index([status])
+}
+
+/// Line item with a price snapshot, so editing a menu never rewrites order history.
+model OrderItem {
+  id             String  @id @default(cuid())
+  name           String // snapshot of MenuItem.name at purchase time
+  unitPriceCents Int // snapshot of MenuItem.priceCents at purchase time
+  quantity       Int
+  lineTotalCents Int
+  remarks        String? // e.g. "less ice"
+
+  orderId    String
+  order      Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItemId String?
+  menuItem   MenuItem? @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+}
