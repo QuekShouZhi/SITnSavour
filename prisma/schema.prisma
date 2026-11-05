@@ -1,6 +1,8 @@
-// SITnSavour – Prisma schema (DRAFT v1, awaiting approval)
+// SITnSavour – Prisma schema
 // Money is stored as integer minor units (cents) to avoid floating-point errors
 // and to match Stripe's API, which also uses minor units.
+// The app uses a single currency (SGD) from config; currency is still stored
+// on Order and Payment as a historical record.
 
 generator client {
   provider = "prisma-client-js"
@@ -13,12 +15,6 @@ datasource db {
 }
 
 // ───────────── Enums ─────────────
-
-enum Role {
-  CUSTOMER
-  MERCHANT_OWNER
-  ADMIN
-}
 
 enum OutletType {
   FOOD_COURT // multiple stalls (e.g. Koufu)
@@ -40,31 +36,36 @@ enum OrderStatus {
   PAYMENT_FAILED
 }
 
+enum PaymentStatus {
+  PENDING // Checkout session created
+  SUCCEEDED // confirmed by webhook
+  FAILED
+  CANCELLED // session expired or abandoned
+}
+
 // ───────────── Models ─────────────
 
 model User {
   id        String   @id @default(cuid())
+  firstName String
+  lastName  String
   email     String   @unique
-  name      String?
   phone     String?
-  role      Role     @default(CUSTOMER)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  orders         Order[]
-  ownedMerchants Merchant[] @relation("MerchantOwner")
+  orders Order[]
+
+  @@map("users")
 }
 
 /// A physical location. A food court holds many merchants (stalls);
 /// a standalone outlet holds exactly one.
 model Outlet {
   id        String     @id @default(cuid())
-  slug      String     @unique
   name      String
   type      OutletType
   address   String?
-  city      String
-  country   String // ISO 3166-1 alpha-2, e.g. "SG"
   timezone  String // IANA, e.g. "Asia/Singapore" – used for opening hours & pickup times
   latitude  Float?
   longitude Float?
@@ -74,17 +75,15 @@ model Outlet {
 
   merchants Merchant[]
 
-  @@index([country, city])
+  @@map("outlets")
 }
 
 model Merchant {
   id               String   @id @default(cuid())
-  slug             String   @unique
   name             String
   description      String?
   cuisine          String?
   imageUrl         String?
-  currency         String   @default("SGD") // ISO 4217, passed to Stripe
   opensAt          String // "HH:mm" in the outlet's timezone
   closesAt         String // "HH:mm" in the outlet's timezone
   takeawayFeeCents Int      @default(0)
@@ -93,14 +92,13 @@ model Merchant {
   updatedAt        DateTime @updatedAt
 
   outletId String
-  outlet   Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  ownerId  String?
-  owner    User?   @relation("MerchantOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  outlet   Outlet @relation(fields: [outletId], references: [id], onDelete: Cascade)
 
   menuItems MenuItem[]
   orders    Order[]
 
   @@index([outletId])
+  @@map("merchants")
 }
 
 model MenuItem {
@@ -121,6 +119,7 @@ model MenuItem {
   orderItems OrderItem[]
 
   @@index([merchantId, category])
+  @@map("menu_items")
 }
 
 /// One order = one merchant (keeps checkout, payment and reporting simple).
@@ -141,11 +140,6 @@ model Order {
   takeawayFeeCents Int    @default(0)
   totalCents       Int
 
-  // Stripe
-  stripeCheckoutSessionId String?   @unique
-  stripePaymentIntentId   String?   @unique
-  paidAt                  DateTime?
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -154,11 +148,13 @@ model Order {
   merchantId String
   merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Restrict)
 
-  items OrderItem[]
+  items    OrderItem[]
+  payments Payment[]
 
   @@index([merchantId, createdAt]) // analytics (Trends) queries
   @@index([userId, createdAt]) // past orders
   @@index([status])
+  @@map("orders")
 }
 
 /// Line item with a price snapshot, so editing a menu never rewrites order history.
@@ -176,4 +172,51 @@ model OrderItem {
   menuItem   MenuItem? @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
 
   @@index([orderId])
+  @@map("order_items")
+}
+
+/// One row per payment attempt. An order can have many attempts (retries after failure).
+/// Never store the full card number – only brand and last4.
+model Payment {
+  id          String        @id @default(cuid())
+  status      PaymentStatus @default(PENDING)
+  amountCents Int
+  currency    String
+
+  stripeCheckoutSessionId String? @unique
+  stripePaymentIntentId   String? @unique
+
+  cardBrand      String? // e.g. "visa"
+  cardLast4      String? // last 4 digits only
+  failureCode    String?
+  failureMessage String?
+  paidAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  events PaymentEvent[]
+
+  @@index([orderId])
+  @@index([status])
+  @@map("payments")
+}
+
+/// Raw Stripe webhook events. The unique Stripe event id makes webhook handling idempotent.
+model PaymentEvent {
+  id            String    @id @default(cuid())
+  stripeEventId String    @unique
+  type          String // e.g. "checkout.session.completed"
+  payload       Json // raw event payload
+  processedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([paymentId])
+  @@map("payment_events")
 }
